@@ -1,5 +1,10 @@
 # script-wp-ubuntu
 
+Скрипты для Ubuntu:
+- `install_smbclient.sh` — установка smbclient (Samba-клиент);
+- `fix_wp_upload_max_filesize.sh` — исправление ошибки WordPress «Загруженный файл
+  превышает директиву upload_max_filesize в php.ini.»
+
 ## install_smbclient.sh
 
 Скрипт для Ubuntu, устанавливающий **smbclient** (Samba-клиент: доступ к SMB/CIFS-шарам из консоли).
@@ -54,3 +59,38 @@ smbclient -L //server -U user                # список шар сервер�
 smbclient //server/share -U user             # интерактивный сеанс
 smbclient //server/share -N -c 'get file'    # анонимное скачивание файла
 ```
+
+## fix_wp_upload_max_filesize.sh
+
+Исправляет ошибку WordPress **«Загруженный файл превышает директиву upload_max_filesize
+в php.ini.»** при загрузке файлов через админку.
+
+Что делает:
+1. находит установки WordPress (`wp-settings.php`) в `/var/www`, `/srv` (или через `--wp-path`);
+2. правит php.ini только веб-SAPI (fpm, apache2, cgi) — CLI не трогает;
+3. ставит `upload_max_filesize = 64M`, поднимает `post_max_size` (>= upload)
+   и `memory_limit` (>= post, минимум 128M; `-1` не трогает);
+4. бэкапит каждый изменённый php.ini (`php.ini.bak.<метка времени>`);
+5. перезагружает `phpX.Y-fpm` / `apache2` (systemctl → service → предупреждение);
+6. опционально `--user-ini` — пишет `.user.ini` в корень WordPress.
+
+```bash
+sudo ./fix_wp_upload_max_filesize.sh                      # поиск WP + лимит 64M
+sudo ./fix_wp_upload_max_filesize.sh --size 128M          # другой лимит
+sudo ./fix_wp_upload_max_filesize.sh --wp-path /var/www/html --user-ini
+sudo ./fix_wp_upload_max_filesize.sh --dry-run            # только показать изменения
+sudo ./fix_wp_upload_max_filesize.sh --no-restart         # без перезагрузки сервисов
+sudo ./fix_wp_upload_max_filesize.sh --force              # применить, даже если WP не найден
+```
+
+Коды возврата: `0` — успех (в т.ч. «лимиты уже достаточны»), `1` — ошибка, `2` — неверные аргументы.
+
+### Тестирование
+
+```bash
+tests/test_wp_upload.sh    # 28 проверок на мок-окружении (не требует PHP/WordPress)
+```
+
+Примечание: если файлы большого размера не грузятся и после этого скрипта — проверьте
+`client_max_body_size` в nginx (ошибка 413) и `LimitRequestBody` в Apache: это отдельные
+ограничения веб-сервера, не относящиеся к php.ini.
