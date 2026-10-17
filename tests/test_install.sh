@@ -115,9 +115,36 @@ case " $* " in
   *" update "*) exit "${MOCK_APT_UPDATE_RC:-0}" ;;
   *" install "*)
     if [[ "${MOCK_APT_INSTALL_RC:-0}" -ne 0 ]]; then exit "$MOCK_APT_INSTALL_RC"; fi
+    # Режим «первая установка падает по локу, повтор успешен»:
+    # дополнительно продлеваем удержание блокировки на 3 секунды
+    if [[ -n "${MOCK_INSTALL_FAIL_ONCE:-}" && ! -f "${MOCKSTATEDIR}/fail_done" ]]; then
+      touch "${MOCKSTATEDIR}/fail_done"
+      echo "$(( $(date +%s) + 3 ))" > "${MOCKSTATEDIR}/lock_until"
+      exit 100
+    fi
     touch "${MOCKSTATEDIR}/installed"; exit 0 ;;
 esac
 exit 0
+EOF
+
+cat > "$MOCKBIN/fuser" <<'EOF'
+#!/usr/bin/env bash
+# Имитация fuser: «держатель блокировки» активен, пока не истечёт lock_until
+until_ts="$(cat "${MOCKSTATEDIR}/lock_until" 2>/dev/null || echo 0)"
+if (( $(date +%s) < until_ts )); then
+  echo "${MOCK_LOCK_PID:-4242}"
+fi
+exit 0
+EOF
+
+cat > "$MOCKBIN/ps" <<'EOF'
+#!/usr/bin/env bash
+# Имитация ps: для запроса имени процесса выдаём unattended-upgr, остальное — насквозь
+if [[ "${1:-}" == "-o" && "${2:-}" == "comm=" ]]; then
+  echo "unattended-upgr"
+  exit 0
+fi
+exec /bin/ps "$@"
 EOF
 
 cat > "$MOCKBIN/dpkg-query" <<'EOF'
@@ -138,10 +165,10 @@ esac
 exit 0
 EOF
 
-chmod +x "$MOCKBIN/apt-get" "$MOCKBIN/dpkg-query" "$MOCKBIN/smbclient"
+chmod +x "$MOCKBIN/apt-get" "$MOCKBIN/dpkg-query" "$MOCKBIN/smbclient" "$MOCKBIN/fuser" "$MOCKBIN/ps"
 
 mock_run() { $MSUDO env PATH="$MOCKBIN:$PATH" MOCKSTATEDIR="$MOCKSTATEDIR" "$INSTALLER" "$@"; }
-mock_count() { grep -c "^apt-get install" "$MOCKSTATEDIR/apt.log" 2>/dev/null || true; }
+mock_count() { grep -c " install " "$MOCKSTATEDIR/apt.log" 2>/dev/null || true; }
 
 # 3.1 Свежая установка
 rm -rf "$MOCKSTATEDIR"; mkdir -p "$MOCKSTATEDIR"
@@ -151,7 +178,7 @@ if [[ $RC -eq 0 && "$OUT" == *"Установка завершена успеш�
 else
   bad "мок: свежая установка (код: $RC)"; printf '        вывод: %s\n' "$(echo "$OUT" | head -3)"
 fi
-if grep -q "^apt-get update" "$MOCKSTATEDIR/apt.log" 2>/dev/null && [[ "$(mock_count)" == "1" ]]; then
+if grep -q " update " "$MOCKSTATEDIR/apt.log" 2>/dev/null && [[ "$(mock_count)" == "1" ]]; then
   ok "мок: вызван apt-get update и ровно один apt-get install"
 else
   bad "мок: неверный набор вызовов apt-get"
@@ -183,9 +210,9 @@ rm -rf "$MOCKSTATEDIR"; mkdir -p "$MOCKSTATEDIR"
 OUT="$(mock_run --no-update 2>&1)"; RC=$?
 if [[ $RC -ne 0 ]]; then
   bad "мок: --no-update (код: $RC)"
-elif grep -q "^apt-get update" "$MOCKSTATEDIR/apt.log" 2>/dev/null; then
+elif grep -q " update " "$MOCKSTATEDIR/apt.log" 2>/dev/null; then
   bad "мок: --no-update всё равно вызвал apt-get update"
-elif grep -q "^apt-get install" "$MOCKSTATEDIR/apt.log" 2>/dev/null; then
+elif grep -q " install " "$MOCKSTATEDIR/apt.log" 2>/dev/null; then
   ok "мок: --no-update пропускает apt-get update"
 else
   bad "мок: --no-update — install не вызван"
@@ -216,6 +243,41 @@ if [[ $RC -ne 0 && "$OUT" == *"Не удалось получить версию
   ok "мок: верификация ловит сломанный smbclient"
 else
   bad "мок: верификация не сработала (код: $RC)"
+fi
+
+# 3.8 Блокировка dpkg удерживается (unattended-upgrades) — дожидаемся и ставим
+rm -rf "$MOCKSTATEDIR"; mkdir -p "$MOCKSTATEDIR"
+echo "$(( $(date +%s) + 2 ))" > "$MOCKSTATEDIR/lock_until"
+OUT="$($MSUDO env PATH="$MOCKBIN:$PATH" MOCKSTATEDIR="$MOCKSTATEDIR" SMB_LOCK_POLL=1 "$INSTALLER" 2>&1)"; RC=$?
+if [[ $RC -eq 0 && "$OUT" == *"удерживается процессом: unattended-upgr"* \
+      && "$OUT" == *"фоновое автообновление"* && "$OUT" == *"Установка завершена успешно"* ]]; then
+  ok "мок: блокировка dpkg (unattended-upgrades) — дождались освобождения и установили"
+else
+  bad "мок: обход блокировки unattended-upgrades (код: $RC)"
+  printf '        вывод: %s\n' "$(echo "$OUT" | head -5)"
+fi
+
+# 3.9 Блокировка держится дольше таймаута — понятная ошибка
+rm -rf "$MOCKSTATEDIR"; mkdir -p "$MOCKSTATEDIR"
+echo "$(( $(date +%s) + 600 ))" > "$MOCKSTATEDIR/lock_until"
+OUT="$($MSUDO env PATH="$MOCKBIN:$PATH" MOCKSTATEDIR="$MOCKSTATEDIR" SMB_LOCK_POLL=1 \
+        "$INSTALLER" --lock-timeout 2 2>&1)"; RC=$?
+if [[ $RC -ne 0 && "$OUT" == *"Не дождались освобождения блокировки"* ]]; then
+  ok "мок: таймаут ожидания блокировки — понятная ошибка"
+else
+  bad "мок: таймаут ожидания блокировки (код: $RC)"
+fi
+
+# 3.10 Лок перехвачен между проверкой и установкой — повтор после ожидания
+rm -rf "$MOCKSTATEDIR"; mkdir -p "$MOCKSTATEDIR"
+OUT="$($MSUDO env PATH="$MOCKBIN:$PATH" MOCKSTATEDIR="$MOCKSTATEDIR" SMB_LOCK_POLL=1 \
+        MOCK_INSTALL_FAIL_ONCE=1 "$INSTALLER" 2>&1)"; RC=$?
+if [[ $RC -eq 0 && "$OUT" == *"повторяем один раз"* \
+      && "$(mock_count)" == "2" && "$OUT" == *"Установка завершена успешно"* ]]; then
+  ok "мок: лок перехвачен между проверкой и установкой — повтор успешен"
+else
+  bad "мок: повтор после срыва установки (код: $RC, установок: $(mock_count))"
+  printf '        вывод: %s\n' "$(echo "$OUT" | head -5)"
 fi
 
 $MSUDO rm -rf "$MOCKBIN" "$MOCKSTATEDIR" 2>/dev/null || rm -rf "$MOCKBIN" "$MOCKSTATEDIR"

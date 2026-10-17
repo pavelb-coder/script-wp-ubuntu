@@ -22,6 +22,8 @@ SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 FORCE=false      # --force: принудительная переустановка/обновление
 NO_UPDATE=false  # --no-update: пропустить apt-get update
 PKG="smbclient"
+LOCK_TIMEOUT=300                 # сек. ожидания освобождения блокировок apt/dpkg (0 — не ждать)
+LOCK_POLL="${SMB_LOCK_POLL:-5}"  # интервал опроса блокировок, сек. (ручка для тестов)
 
 # ---------------------------------------------------------------------------
 # Логирование (цвета отключаются, если stdout не терминал — важно для CI)
@@ -44,9 +46,11 @@ usage() {
 Использование: ${SCRIPT_NAME} [ОПЦИИ]
 
 Опции:
-  --force       Принудительно обновить/переустановить пакет, даже если он уже установлен
-  --no-update   Не выполнять 'apt-get update' перед установкой
-  -h, --help    Показать эту справку
+  --force              Принудительно обновить/переустановить пакет, даже если он уже установлен
+  --no-update          Не выполнять 'apt-get update' перед установкой
+  --lock-timeout N     Ждать освобождения блокировки apt/dpkg до N секунд (по умолчанию 300; 0 — не ждать).
+                       Типичный держатель блокировки — фоновое автообновление unattended-upgrades.
+  -h, --help           Показать эту справку
 
 Без опций скрипт идемпотентен: если ${PKG} уже установлен,
 выводится версия и скрипт завершается с кодом 0.
@@ -56,12 +60,106 @@ EOF
 die() { log_err "$*"; exit 1; }
 
 # ---------------------------------------------------------------------------
+# Блокировки apt/dpkg: ожидание освобождения (unattended-upgrades и др.)
+# ---------------------------------------------------------------------------
+DPKG_LOCKS=(
+  /var/lib/dpkg/lock-frontend
+  /var/lib/dpkg/lock
+  /var/lib/apt/lists/lock
+  /var/cache/apt/archives/lock
+)
+
+# PID-ы процессов, удерживающих хотя бы один лок (пусто/код 1 — никто не держит)
+lock_holders() {
+  local holders
+  if command -v fuser >/dev/null 2>&1; then
+    holders="$(_lock_holders_fuser || true)"
+  else
+    holders="$(_lock_holders_proc || true)"
+  fi
+  [[ -n "$holders" ]] && printf '%s\n' "$holders"
+}
+
+# Вариант с fuser из пакета psmisc
+_lock_holders_fuser() {
+  local lock pids=""
+  for lock in "${DPKG_LOCKS[@]}"; do
+    [[ -e "$lock" ]] || continue
+    pids+=" $(fuser "$lock" 2>/dev/null || true)"
+  done
+  printf '%s\n' "$pids" | tr -s ' \t\n' ' ' | tr ' ' '\n' | sort -u | grep -v '^$'
+}
+
+# Fallback без psmisc (минимальные контейнеры): сканируем открытые fd в /proc.
+# Работает от root — к этому моменту скрипт уже повышен через sudo.
+_lock_holders_proc() {
+  local pid fd target lock
+  for pid in /proc/[0-9]*; do
+    for fd in "$pid"/fd/*; do
+      target="$(readlink "$fd" 2>/dev/null)" || continue
+      for lock in "${DPKG_LOCKS[@]}"; do
+        if [[ "$target" == "$lock" || "$target" == "$lock (deleted)" ]]; then
+          echo "${pid#/proc/}"
+          break 2
+        fi
+      done
+    done
+  done | sort -u
+}
+
+# Имя процесса по PID: /proc/<pid>/comm, затем ps, затем просто pid
+lock_holder_name() {
+  local pid="$1" name=""
+  name="$(cat "/proc/${pid}/comm" 2>/dev/null)" \
+    || name="$(ps -o comm= -p "$pid" 2>/dev/null)" \
+    || name=""
+  if [[ -z "$name" ]]; then
+    echo "pid ${pid}"
+  else
+    echo "${name} (pid ${pid})"
+  fi
+}
+
+wait_for_apt_lock() {
+  if (( LOCK_TIMEOUT <= 0 )); then return 0; fi
+  local waited=0 pids pid names first=1
+  while pids="$(lock_holders)"; do
+    names=""
+    for pid in $pids; do
+      names+=", $(lock_holder_name "$pid")"
+    done
+    names="${names#, }"
+    if (( first )); then
+      first=0
+      log_warn "Блокировка apt/dpkg удерживается процессом: ${names:-неизвестно}."
+      if [[ "$names" == *unattended* ]]; then
+        log_info "Похоже, работает фоновое автообновление (unattended-upgrades) — дожидаемся его завершения."
+      fi
+      log_info "Ожидание освобождения блокировки (до ${LOCK_TIMEOUT}s, опрос каждые ${LOCK_POLL}s)…"
+    else
+      log_info "Блокировка ещё удерживается (${waited}s/${LOCK_TIMEOUT}s)…"
+    fi
+    if (( waited >= LOCK_TIMEOUT )); then
+      die "Не дождались освобождения блокировки apt/dpkg за ${LOCK_TIMEOUT}s. Запустите скрипт позже или увеличьте --lock-timeout."
+    fi
+    sleep "$LOCK_POLL"
+    waited=$((waited + LOCK_POLL))
+  done
+}
+
+# ---------------------------------------------------------------------------
 # Разбор аргументов
 # ---------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --force)     FORCE=true; shift ;;
     --no-update) NO_UPDATE=true; shift ;;
+    --lock-timeout)
+      if [[ -z "${2:-}" || ! "$2" =~ ^[0-9]+$ ]]; then
+        usage >&2
+        die "--lock-timeout: ожидается неотрицательное число секунд, получено: ${2:-<пусто>}"
+      fi
+      LOCK_TIMEOUT="$2"; shift 2 ;;
     -h|--help)   usage; exit 0 ;;
     *)           usage >&2; die "Неизвестный аргумент: $1" ;;
   esac
@@ -117,15 +215,29 @@ fi
 # ---------------------------------------------------------------------------
 # Установка
 # ---------------------------------------------------------------------------
+APT_LOCK_OPT=(-o "DPkg::Lock::Timeout=${LOCK_TIMEOUT}")
+
+wait_for_apt_lock
+
 if [[ "$NO_UPDATE" == true ]]; then
   log_info "apt-get update пропущен (--no-update)."
-elif ! apt-get update -y; then
+elif ! apt-get "${APT_LOCK_OPT[@]}" update -y; then
   log_warn "apt-get update завершился с ошибкой — пробуем установить из кэша."
 fi
 
+wait_for_apt_lock
+
 log_info "Установка ${PKG}…"
-if ! apt-get install -y --no-install-recommends "$PKG"; then
-  die "Не удалось установить ${PKG}. Проверьте доступность apt-зеркал и повторите попытку."
+if ! apt-get "${APT_LOCK_OPT[@]}" install -y --no-install-recommends "$PKG"; then
+  if (( LOCK_TIMEOUT > 0 )) && lock_holders >/dev/null 2>&1; then
+    log_warn "Установка сорвалась из-за блокировки apt/dpkg. Ожидаем освобождения и повторяем один раз."
+    wait_for_apt_lock
+    if ! apt-get "${APT_LOCK_OPT[@]}" install -y --no-install-recommends "$PKG"; then
+      die "Не удалось установить ${PKG} даже после ожидания блокировки. Проверьте apt-зеркала и процессы, держащие лок."
+    fi
+  else
+    die "Не удалось установить ${PKG}. Проверьте доступность apt-зеркал и повторите попытку."
+  fi
 fi
 
 # ---------------------------------------------------------------------------

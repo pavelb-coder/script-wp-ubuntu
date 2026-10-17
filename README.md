@@ -11,6 +11,12 @@
 - проверка ОС (Ubuntu/Debian, предупреждение для остальных apt-дистрибутивов);
 - автоподъём прав: при запуске не от root скрипт перезапускает себя через sudo;
 - `apt-get update` при сбое сети не фатален — попытка установки из кэша;
+- **обход блокировки apt/dpkg**: если `/var/lib/dpkg/lock-frontend` и другие локи удерживаются
+  процессом (обычно фоновое автообновление unattended-upgrades), скрипт определяет держателя
+  по имени и PID, ждёт освобождения (по умолчанию до 300 с, настраивается `--lock-timeout`)
+  и повторяет установку; если лок перехвачен между проверкой и установкой — один повтор
+  после ожидания. Держатель лока ищется через `fuser` (psmisc), а при его отсутствии —
+  сканированием `/proc/*/fd` (работает в минимальных контейнерах);
 - верификация после установки: бинарник в PATH, версия, статус в dpkg, ответ на `--usage`;
 - без цвета в неинтерактивном выводе (пригодно для CI и логов).
 
@@ -18,10 +24,12 @@
 
 ```bash
 chmod +x install_smbclient.sh
-sudo ./install_smbclient.sh              # установка
-sudo ./install_smbclient.sh --force      # принудительное обновление/переустановка
-sudo ./install_smbclient.sh --no-update  # пропустить apt-get update
-./install_smbclient.sh --help            # справка
+sudo ./install_smbclient.sh                        # установка
+sudo ./install_smbclient.sh --force                # принудительное обновление/переустановка
+sudo ./install_smbclient.sh --no-update            # пропустить apt-get update
+sudo ./install_smbclient.sh --lock-timeout 600     # ждать освобождения лока dpkg до 10 минут
+sudo ./install_smbclient.sh --lock-timeout 0       # не ждать блокировку (старое поведение)
+./install_smbclient.sh --help                      # справка
 ```
 
 Коды возврата: `0` — успех (в т.ч. «уже установлен»), `1` — ошибка, `2` — неверные аргументы.
